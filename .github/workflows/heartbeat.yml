@@ -10,7 +10,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: seat-watch
+  group: seat-heartbeat
   cancel-in-progress: false
 
 jobs:
