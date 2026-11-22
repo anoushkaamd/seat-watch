@@ -12,6 +12,7 @@ Modes:
   once        print current seat counts to the log, no alerts
   test-alert  send a test notification to your phone
   list-terms  print Banner term codes
+  heartbeat   daily "still working" notification (stops after HEARTBEAT_UNTIL)
 """
 
 import argparse
@@ -21,7 +22,7 @@ import random
 import string
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 
@@ -31,6 +32,9 @@ REG_URL = f"{BASE}/registration"
 HERE = os.path.dirname(os.path.abspath(__file__))
 WATCHLIST_PATH = os.path.join(HERE, "watchlist.json")
 STATE_PATH = os.path.join(HERE, "state.json")
+HEARTBEAT_PATH = os.path.join(HERE, "heartbeat.json")
+HEARTBEAT_UNTIL = date(2027, 2, 1)   # last day a daily heartbeat is sent
+HEARTBEAT_MIN_RUNS = 12              # watch runs expected in 24h before it counts as healthy
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 RUN_MINUTES = float(os.environ.get("RUN_MINUTES", "4"))
@@ -82,7 +86,7 @@ def save_state(st):
 
 # ----------------------------- alerts ---------------------------------------
 
-def push(title, msg, priority="high"):
+def push(title, msg, priority="high", tags="rotating_light"):
     log(f"ALERT: {title}: {msg}")
     if not NTFY_TOPIC:
         log("NTFY_TOPIC secret is not set, so no phone alert was sent.")
@@ -92,7 +96,7 @@ def push(title, msg, priority="high"):
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=msg.encode("utf-8"),
             headers={"Title": title, "Priority": priority,
-                     "Tags": "rotating_light", "Click": REG_URL},
+                     "Tags": tags, "Click": REG_URL},
             timeout=15,
         )
         r.raise_for_status()
@@ -106,6 +110,57 @@ def push_repeated(title, msg):
         push(f"{title} ({i}/{SEAT_ALERT_REPEATS})", msg, priority="urgent")
         if i < SEAT_ALERT_REPEATS:
             time.sleep(SEAT_ALERT_GAP_SECONDS)
+
+
+def heartbeat():
+    """Daily status push. Reports how many watch runs succeeded in the
+    last 24h, and flags a problem if the schedule seems to have stalled."""
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    if today > HEARTBEAT_UNTIL:
+        log(f"Past {HEARTBEAT_UNTIL}, no heartbeat sent.")
+        return
+
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    token = os.environ.get("GITHUB_TOKEN", "")
+    ok = failed = None
+    if repo and token:
+        since = (now - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            r = requests.get(
+                f"https://api.github.com/repos/{repo}/actions/workflows/seat-watch.yml/runs",
+                params={"created": f">={since}", "per_page": 100},
+                headers={"Authorization": f"Bearer {token}",
+                         "Accept": "application/vnd.github+json"},
+                timeout=20,
+            )
+            r.raise_for_status()
+            runs = r.json().get("workflow_runs", [])
+            ok = sum(1 for x in runs if x.get("conclusion") == "success")
+            failed = sum(1 for x in runs if x.get("conclusion") in ("failure", "timed_out"))
+        except Exception as e:
+            log(f"Could not read run history: {e}")
+
+    days_left = (HEARTBEAT_UNTIL - today).days
+    tail = ("Last daily update, watching until now." if days_left == 0
+            else f"Daily updates continue for {days_left} more day(s).")
+    if ok is None:
+        push("Seat watcher: status unknown",
+             f"Could not read run history. {tail}", priority="default",
+             tags="warning")
+    elif ok >= HEARTBEAT_MIN_RUNS:
+        push("Seat watcher is working",
+             f"{ok} checks ran OK in the last 24h ({failed} failed). {tail}",
+             priority="low", tags="white_check_mark")
+    else:
+        push("Seat watcher problem",
+             f"Only {ok} watch runs completed in the last 24h ({failed} failed). "
+             "Check the Actions tab on GitHub.", priority="high", tags="warning")
+
+    with open(HEARTBEAT_PATH, "w") as f:
+        json.dump({"last_heartbeat": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "scheduled_ok_24h": ok}, f, indent=2)
+        f.write("\n")
 
 
 # ----------------------------- Banner ---------------------------------------
@@ -203,11 +258,14 @@ def check_all(s, term, courses, state, alert, verbose):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="watch",
-                    choices=["watch", "once", "test-alert", "list-terms"])
+                    choices=["watch", "once", "test-alert", "list-terms", "heartbeat"])
     mode = ap.parse_args().mode or "watch"
 
     if mode == "list-terms":
         list_terms()
+        return
+    if mode == "heartbeat":
+        heartbeat()
         return
     if mode == "test-alert":
         push_repeated("Seat watcher test", "If you see this, phone alerts are working.")

@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: seat-watch
@@ -50,3 +51,14 @@ jobs:
               git push
             fi
           fi
+
+      # GitHub's cron is often late or skipped, so each run queues the next one.
+      # The concurrency group makes the new run wait until this one finishes.
+      # The cron above stays as a backup if the chain ever breaks.
+      - name: Queue next run
+        if: always() && (github.event.inputs.mode || 'watch') == 'watch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sleep 30
+          gh workflow run seat-watch.yml --ref "${{ github.ref_name }}" -f mode=watch
